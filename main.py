@@ -38,9 +38,20 @@ ADMIN_IDS = {
 if not ADMIN_IDS:
     print("⚠️  ADMIN_IDS пуст — админ-команды никому не доступны.")
 
-DOWNLOAD_DIR       = os.getenv("DOWNLOAD_DIR", "downloads")
-CACHE_DIR          = os.getenv("CACHE_DIR", "cache")
-DB_PATH            = os.getenv("DB_PATH", "bot.db")
+# ── Все данные пишем в DATA_DIR, если он задан (для хостингов)
+DATA_DIR = os.getenv("DATA_DIR", "").strip()
+if DATA_DIR:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    DOWNLOAD_DIR = os.path.join(DATA_DIR, "downloads")
+    CACHE_DIR    = os.path.join(DATA_DIR, "cache")
+    DB_PATH      = os.path.join(DATA_DIR, "bot.db")
+    LOG_DIR      = os.path.join(DATA_DIR, "logs")
+else:
+    DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
+    CACHE_DIR    = os.getenv("CACHE_DIR", "cache")
+    DB_PATH      = os.getenv("DB_PATH", "bot.db")
+    LOG_DIR      = "logs"
+
 MAX_FILE_SIZE_MB   = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_DURATION_SEC   = int(os.getenv("MAX_DURATION_SEC", "600"))
 DOWNLOAD_TIMEOUT   = int(os.getenv("DOWNLOAD_TIMEOUT", "300"))
@@ -60,7 +71,7 @@ BLOCKED_DOMAINS = {
     d.strip().lower() for d in os.getenv("BLOCKED_DOMAINS", "").split(",") if d.strip()
 }
 
-for d in (DOWNLOAD_DIR, CACHE_DIR, "logs"):
+for d in (DOWNLOAD_DIR, CACHE_DIR, LOG_DIR):
     os.makedirs(d, exist_ok=True)
 
 # ─────────────────────────── LOGGING ───────────────────────
@@ -69,7 +80,8 @@ logger.setLevel(LOG_LEVEL)
 _fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
                          datefmt="%Y-%m-%d %H:%M:%S")
 _sh = logging.StreamHandler(); _sh.setFormatter(_fmt); logger.addHandler(_sh)
-_fh = RotatingFileHandler("logs/bot.log", maxBytes=5*1024*1024, backupCount=3, encoding="utf-8")
+_fh = RotatingFileHandler(os.path.join(LOG_DIR, "bot.log"),
+                          maxBytes=5*1024*1024, backupCount=3, encoding="utf-8")
 _fh.setFormatter(_fmt); logger.addHandler(_fh)
 
 # ─────────────────────────── DB ────────────────────────────
@@ -254,7 +266,11 @@ def is_domain_allowed(url: str) -> tuple[bool, str]:
 def cleanup_stale_dirs():
     now = time.time()
     for base in (DOWNLOAD_DIR,):
-        for name in os.listdir(base):
+        try:
+            entries = os.listdir(base)
+        except OSError:
+            return
+        for name in entries:
             path = os.path.join(base, name)
             try:
                 if os.path.isdir(path) and now - os.path.getmtime(path) > 3600:
@@ -550,9 +566,10 @@ async def _safe_edit_markup(chat_id: int, message_id: int, text: str, kb=None):
 
 # ═══════════════════════════════════════════════════════════
 #  ВАЖНО: ПОРЯДОК ХЕНДЛЕРОВ
-#  1) Команды (/start, /help, /admin, /stats, ...)
-#  2) Callback-кнопки
-#  3) Ловец любого текста (F.text) — САМЫМ ПОСЛЕДНИМ
+#  1) /start, /help
+#  2) Админ-команды
+#  3) Callbacks
+#  4) F.text (ловец URL) — последним
 # ═══════════════════════════════════════════════════════════
 
 # ─────────────────────────── USER: START / HELP ────────────
@@ -763,7 +780,9 @@ async def admin_limits(message: Message):
         f"Proxy: {'✅' if PROXY else '—'}\n"
         f"Likee UA: {'✅' if LIKEE_USER_AGENT else '—'}\n"
         f"Белый список: {', '.join(sorted(ALLOWED_DOMAINS)) or '—'}\n"
-        f"Чёрный список: {', '.join(sorted(BLOCKED_DOMAINS)) or '—'}"
+        f"Чёрный список: {', '.join(sorted(BLOCKED_DOMAINS)) or '—'}\n\n"
+        f"DATA_DIR: <code>{html.escape(DATA_DIR or '—')}</code>\n"
+        f"DB: <code>{html.escape(DB_PATH)}</code>"
     )
 
 @dp.message(Command("pending"), IsAdmin())
@@ -967,7 +986,6 @@ async def _do_download(cb: CallbackQuery, task: PendingTask,
                 shutil.rmtree(temp_dir_cleanup, ignore_errors=True)
 
 # ─────────────────────────── ЛОВЕЦ ТЕКСТА (ПОСЛЕДНИЙ!) ────
-# ВАЖНО: ~F.text.startswith("/") — чтобы команды НЕ попадали сюда.
 @dp.message(F.text, ~F.text.startswith("/"))
 async def probe_handler(message: Message):
     u = message.from_user
@@ -1069,18 +1087,14 @@ async def probe_handler(message: Message):
         except Exception:
             pass
 
-# ─────────────────────────── FALLBACK ДЛЯ ПРОЧИХ ───────────
+# ─────────────────────────── FALLBACK ──────────────────────
 @dp.message()
 async def fallback_handler(message: Message):
     """Ловит нетекстовые сообщения или текст без URL после probe_handler."""
     if message.text and message.text.startswith("/"):
-        await message.answer(
-            "🤷 Не знаю такой команды. Попробуй /help"
-        )
+        await message.answer("🤷 Не знаю такой команды. Попробуй /help")
     else:
-        await message.answer(
-            "Пожалуйста, отправь ссылку на видео (http...)."
-        )
+        await message.answer("Пожалуйста, отправь ссылку на видео (http...).")
 
 # ─────────────────────────── START / STOP ──────────────────
 async def on_startup():
@@ -1089,9 +1103,13 @@ async def on_startup():
                 len(ADMIN_IDS), MAX_FILE_SIZE_MB,
                 human_time(MAX_DURATION_SEC), MAX_CONCURRENT)
     print(f"✅ ADMIN_IDS = {sorted(ADMIN_IDS) or '(пусто!)'}")
+    print(f"✅ DATA_DIR  = {DATA_DIR or '(не задан, используется локальная папка)'}")
+    print(f"✅ DB_PATH   = {DB_PATH}")
+    print(f"✅ LOG_DIR   = {LOG_DIR}")
     try:
         cnt = len(yt_dlp.extractor.gen_extractor_classes())
         logger.info("yt-dlp: загружено экстракторов %s", cnt)
+        print(f"✅ yt-dlp    = {cnt} экстракторов")
     except Exception:
         pass
 
